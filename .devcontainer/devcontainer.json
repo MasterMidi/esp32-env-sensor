@@ -1,0 +1,69 @@
+{
+  "name": "esp32_threads_demo",
+  // Select between image and build propieties to pull or build the image.
+  // "image": "docker.io/espressif/idf-rust:esp32_latest",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "CONTAINER_USER": "esp",
+      "CONTAINER_GROUP": "esp",
+      "ESP_BOARD": "esp32"
+    }
+  },
+  "mounts": [
+    "type=bind,source=/dev/bus/usb,target=/dev/bus/usb"
+  ],
+  "runArgs": [
+    "--privileged"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "editor.formatOnPaste": true,
+        "editor.formatOnSave": true,
+        "editor.formatOnSaveMode": "file",
+        "editor.formatOnType": true,
+        "lldb.executable": "/usr/bin/lldb",
+        "files.watcherExclude": {
+          "**/target/**": true
+        },
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.checkOnSave.allTargets": false,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "yzhang.markdown-all-in-one",
+        "ms-vscode.cpptools",
+        "ms-azuretools.vscode-docker",
+        "panicbit.cargo",
+        "GitHub.copilot",
+        "VisualStudioExptTeam.vscodeintellicode",
+        "christian-kohler.path-intellisense",
+        "belfz.search-crates-io",
+        "sidp.strict-whitespace",
+        "Gruntfuggly.todo-tree",
+        "EditorConfig.EditorConfig",
+        "eamodio.gitlens",
+        "actboy168.tasks",
+        "naumovs.color-highlight",
+        "vadimcn.vscode-lldb",
+        "mcu-debug.debug-tracker-vscode",
+        "albert.TabOut",
+        "ms-vscode.test-adapter-converter",
+        "Swellaby.vscode-rust-test-adapter",
+        "GitHub.vscode-github-actions"
+      ]
+    }
+  },
+  "forwardPorts": [
+    8000,
+    3333
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/esp/esp32_threads_demo,type=bind,consistency=cached",
+  "workspaceFolder": "/home/esp/esp32_threads_demo"
+}
