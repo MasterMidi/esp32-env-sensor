@@ -13,7 +13,7 @@ ARG GITHUB_TOKEN
 
 # update system
 RUN apt-get update && \
-    apt-get install -y nano git curl mold gcc lldb clang ninja-build libudev-dev unzip xz-utils \
+    apt-get install -y nano git curl mold lldb clang ninja-build libudev-dev unzip xz-utils \
     python3 python3-pip python3-venv libusb-1.0-0 libssl-dev pkg-config
 
 # cleanup
@@ -29,7 +29,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
     --default-toolchain none -y --profile minimal
 
 # setup mold linker
-RUN echo "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n" > /home/${CONTAINER_USER}/.cargo/config.toml
+RUN echo "[target.xtensa-esp32-espidf]\nlinker = \"clang\"\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n" > /home/${CONTAINER_USER}/.cargo/config.toml
 
 # Update envs
 ENV PATH=${PATH}:/home/${CONTAINER_USER}/.cargo/bin
