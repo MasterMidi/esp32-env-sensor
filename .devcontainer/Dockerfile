@@ -13,11 +13,12 @@ ARG GITHUB_TOKEN
 
 # update system
 RUN apt-get update && \
-    apt-get install -y nano git curl mold lldb clang ninja-build libudev-dev unzip xz-utils \
+    apt-get install -y nano git curl lldb clang ninja-build libudev-dev unzip xz-utils \
     python3 python3-pip python3-venv libusb-1.0-0 libssl-dev pkg-config
 
 # cleanup
-RUN apt-get clean -y && rm -rf /var/lib/apt/lists/* /tmp/library-scripts
+RUN apt-get clean -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/library-scripts
 
 # Set users
 RUN adduser --disabled-password --gecos "" ${CONTAINER_USER}
@@ -27,9 +28,6 @@ WORKDIR /home/${CONTAINER_USER}
 # Install rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
     --default-toolchain none -y --profile minimal
-
-# setup mold linker
-RUN echo "[target.xtensa-esp32-espidf]\nlinker = \"clang\"\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n" > /home/${CONTAINER_USER}/.cargo/config.toml
 
 # Update envs
 ENV PATH=${PATH}:/home/${CONTAINER_USER}/.cargo/bin
@@ -59,11 +57,8 @@ RUN ${HOME}/.cargo/bin/espup install\
 # Set default toolchain
 RUN rustup default esp
 
-# Install extra crates
-# RUN rustup component add clippy rustfmt
-
 # cargo packages
-RUN cargo install espflash bacon cargo-audit cargo-info
+RUN cargo install ldproxy espflash bacon cargo-audit cargo-info
 
 # Activate ESP environment
 RUN echo "source /home/${CONTAINER_USER}/export-esp.sh" >> ~/.bashrc

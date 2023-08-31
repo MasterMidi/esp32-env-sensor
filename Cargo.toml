@@ -53,6 +53,7 @@ sht4x = "0.1.0"
 shared-bus = { version = "0.3.0", features = ["std"] }
 bitfield = "0.14.0"
 once_cell = "1.18.0"
+scd4x = { version = "0.2.1", features = ["scd41"] }
 
 [build-dependencies]
 embuild = "0.31.2"
