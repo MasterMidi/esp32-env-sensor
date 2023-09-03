@@ -1,5 +1,5 @@
 {
-  "name": "esp32_threads_demo",
+  "name": "esp32_env_sensor",
   // Select between image and build propieties to pull or build the image.
   // "image": "docker.io/espressif/idf-rust:esp32_latest",
   "build": {

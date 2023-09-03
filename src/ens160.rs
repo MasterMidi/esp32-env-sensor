@@ -267,7 +267,7 @@ impl std::fmt::Display for AirqualityConvError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "{} is no valid qirquality value. Values start from 400.",
+            "{} is no valid airquality value. Values start from 400.",
             self.0
         )
     }

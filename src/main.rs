@@ -1,8 +1,16 @@
 use core::result::Result::Ok;
 
-use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
+use embedded_svc::{
+    mqtt::client::{Connection, MessageImpl, QoS},
+    utils::{
+        asyncify::mqtt::client::{AsyncConnState, AsyncConnection},
+        mutex::RawCondvar,
+    },
+    wifi::{AuthMethod, ClientConfiguration, Configuration},
+};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
+    mqtt::client::{EspMqttClient, MqttClientConfiguration},
     nvs::EspDefaultNvsPartition,
     timer::EspTaskTimerService,
     wifi::{AsyncWifi, EspWifi},
@@ -10,7 +18,7 @@ use esp_idf_svc::{
 use scd4x::scd4x::Scd4x;
 use shared_bus::{self, BusManager, I2cProxy};
 
-use async_broadcast::{broadcast, Receiver, Sender};
+use async_broadcast::{broadcast, Receiver, Sender, TryRecvError};
 // use ens160::{AirqualityIndex, Ens160};
 use esp_idf_hal::{cpu::core, i2c::*, peripherals::Peripherals, prelude::*};
 use esp_idf_sys::{self as _, esp, esp_app_desc, EspError}; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
@@ -21,19 +29,31 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     runtime::Handle,
-    task::{JoinError, JoinHandle},
-    time::error::Elapsed,
+    task,
 };
 
-use esp32_threads_demo::ens160::{AirqualityIndex, Ens160};
+use esp32_env_sensor::{
+    ens160::{AirqualityIndex, Ens160},
+    pmsa003i::Pmsa003i,
+};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 
-use std::{self, fmt::Display, sync::Mutex, thread::sleep};
+use std::{self, fmt::Display, sync::Mutex};
 
-// Edit these or provide your own way of provisioning...
-const WIFI_SSID: &str = "Asus RT-AX86U";
-const WIFI_PASS: &str = "3zyn2dY&Gp";
+#[toml_cfg::toml_config]
+pub struct Config {
+    #[default("localhost")]
+    mqtt_host: &'static str,
+    #[default("")]
+    mqtt_user: &'static str,
+    #[default("")]
+    mqtt_pass: &'static str,
+    #[default("")]
+    wifi_ssid: &'static str,
+    #[default("")]
+    wifi_psk: &'static str,
+}
 
 // To test, run `cargo run`, then when the server is up, use `nc -v espressif 12345` from
 // a machine on the same Wi-Fi network.
@@ -70,154 +90,281 @@ fn main() -> Result<()> {
     )?;
 
     info!("Setting up I2C bus...");
-    let sda = peripherals.pins.gpio3;
-    let scl = peripherals.pins.gpio2;
+    let sda = peripherals.pins.gpio21;
+    let scl = peripherals.pins.gpio22;
     let i2c = peripherals.i2c1;
     let config = I2cConfig::new().baudrate(400.kHz().into());
     let driver = I2cDriver::new(i2c, sda, scl, &config)?;
     let bus: &'static _ = shared_bus::new_std!(I2cDriver = driver).unwrap();
 
     info!("Starting async run loop...");
-    match tokio::runtime::Builder::new_multi_thread()
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async_main(bus, wifi))
-    {
-        Ok(_) => info!("async_main: finished..."),
-        Err(e) => {
-            info!("Shutting down...");
-            panic!("async_main: error: {:?}", e)
-        }
-    };
-
-    todo!();
 }
 
 async fn async_main(
-    bus: &'static BusManager<Mutex<I2cDriver<'static>>>,
+    i2c_bus: &'static BusManager<Mutex<I2cDriver<'static>>>,
     wifi: AsyncWifi<EspWifi<'_>>,
 ) -> Result<()> {
     info!("main async: running on core: {:?}", core());
+    let cfg = CONFIG;
+
     let mut wifi_loop = WifiLoop { wifi };
-    wifi_loop.configure().await?;
+    wifi_loop.configure(cfg.wifi_ssid, cfg.wifi_psk).await?;
     wifi_loop.initial_connect().await?;
+    info!("Entering main Wi-Fi run loop...");
+    let connection_loop = wifi_loop.stay_connected();
+
+    info!("setting up MQTT client...");
+    let broker_url = format!("mqtt://{}", cfg.mqtt_host);
+    let mqtt_config = MqttClientConfiguration::default();
+    let mut mqtt = EspMqttClient::new(broker_url, &mqtt_config, move |msg| match msg {
+        Ok(event) => match event {
+            embedded_svc::mqtt::client::Event::Received(msg) => {
+                info!(
+                    "MQTT Message: {} -> {:?}",
+                    msg.id(),
+                    String::from_utf8(msg.data().to_vec())
+                );
+            }
+            _ => info!("MQTT Message: {:?}", event),
+        },
+        Err(e) => info!("MQTT Message ERROR: {}", e),
+    })?;
+
+    mqtt.subscribe("esp32_testing/test", QoS::AtMostOnce)?; // TODO: only for testing
+
+    mqtt.publish(
+        "esp32_testing/test",
+        QoS::ExactlyOnce,
+        true,
+        "hello, world".as_bytes(),
+    )?;
 
     info!("Preparing to launch echo server...");
     tokio::spawn(echo_server());
 
     info!("async_main: setup broadcast channels...");
-    let (mut s1, r1) = broadcast(1);
-    // let (mut sender_ens160, _) = broadcast(1);
-    // let (mut sender_sht45, receiver_sht45) = broadcast(1);
-    // let (mut sender_scd4x, receiver_scd4x) = broadcast(1);
+    let (mut sender_ens160, mut receiver_ens160) = broadcast(1);
+    let (mut sender_sht45, mut receiver_sht45) = broadcast(1);
+    let (mut sender_scd4x, mut receiver_scd4x) = broadcast(1);
+    // let (mut sender_pmsa003i, mut receiver_pmsa003i) = broadcast(1);
 
-    s1.set_overflow(true);
-    // sender_ens160.set_overflow(true);
-    // sender_sht45.set_overflow(true);
-    // sender_scd4x.set_overflow(true);
+    sender_ens160.set_overflow(true);
+    sender_sht45.set_overflow(true);
+    sender_scd4x.set_overflow(true);
+    // sender_pmsa003i.set_overflow(true);
 
-    info!("async_main: spawn sensor threads...");
-    let _ = tokio::spawn(sensor(s1));
-    let _ = tokio::spawn(sensor2(r1));
-
-    // tokio::spawn(sht45_setup(bus.acquire_i2c())).await;
-    // tokio::spawn(ens160_setup(bus.acquire_i2c())).await;
-
-    // let ens160_handler = tokio::spawn(ens160_sensor(
-    //     sender_ens160,
-    //     receiver_sht45,
-    //     bus.acquire_i2c(),
-    // ));
-
-    // let sht45_handler = tokio::spawn(sht45_sensor(sender_sht45, bus.acquire_i2c()));
-
-    // let scd4x_handler = scd41_sensor(bus.acquire_i2c(), sender_scd4x);
-
-    // let _ = t1.await?;
-    // let _ = t2.await?;
-    // sht45_handler.await?;
-    // match ens160_handler.await {
-    //     Ok(_) => info!("ens160_handler: finished"),
-    //     Err(e) => warn!("ens160_handler: error: {:?}", e),
-    // };
-
-    info!("Entering main Wi-Fi run loop...");
-    wifi_loop.stay_connected().await?;
+    info!("setup sensors...");
+    tokio::spawn(ens160_sensor(
+        sender_ens160,
+        receiver_sht45.clone(),
+        i2c_bus.acquire_i2c(),
+    ));
+    tokio::spawn(sht45_sensor(sender_sht45, i2c_bus.acquire_i2c()));
+    tokio::spawn(scd41_sensor(i2c_bus.acquire_i2c(), sender_scd4x));
+    // tokio::spawn(pmsa003i_sensor(i2c_bus.acquire_i2c(), sender_pmsa003i));
 
     loop {
-        info!("main: sleeping...");
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        info!("main loop running");
+
+        let ens160_reading = match receiver_ens160.try_recv() {
+            Ok((tvoc, eco2, aqi)) => Some(SensorReading::Ens160(tvoc, eco2, aqi)),
+            Err(TryRecvError::Overflowed(_)) => match receiver_ens160.try_recv() {
+                Ok((tvoc, eco2, aqi)) => Some(SensorReading::Ens160(tvoc, eco2, aqi)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let sht4x_reading = match receiver_sht45.try_recv() {
+            Ok((rh, temp)) => Some(SensorReading::Sht4x(rh, temp)),
+            Err(TryRecvError::Overflowed(_)) => match receiver_sht45.try_recv() {
+                Ok((rh, temp)) => Some(SensorReading::Sht4x(rh, temp)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let scd4x_reading = match receiver_scd4x.try_recv() {
+            Ok((co2, rh, temp)) => Some(SensorReading::Scd4x(co2, rh, temp)),
+            Err(TryRecvError::Overflowed(_)) => match receiver_scd4x.try_recv() {
+                Ok((co2, rh, temp)) => Some(SensorReading::Scd4x(co2, rh, temp)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        // let pmsa003i_reading = match receiver_pmsa003i.try_recv() {
+        //     Ok((pm1, pm25, pm10)) => Some(SensorReading::Pmsa003i(pm1, pm25, pm10)),
+        //     Err(TryRecvError::Overflowed(_)) => match receiver_pmsa003i.try_recv() {
+        //         Ok((pm1, pm25, pm10)) => Some(SensorReading::Pmsa003i(pm1, pm25, pm10)),
+        //         _ => None,
+        //     },
+        //     _ => None,
+        // };
+
+        if let Some(SensorReading::Ens160(tvoc, eco2, aqi)) = ens160_reading {
+            mqtt.publish(
+                "esp32_testing/tvoc",
+                QoS::ExactlyOnce,
+                true,
+                tvoc.to_string().as_bytes(),
+            )?;
+            mqtt.publish(
+                "esp32_testing/eco2",
+                QoS::ExactlyOnce,
+                true,
+                eco2.to_string().as_bytes(),
+            )?;
+            mqtt.publish(
+                "esp32_testing/aqi",
+                QoS::ExactlyOnce,
+                true,
+                match aqi {
+                    AirqualityIndex::Excellent => "excellent",
+                    AirqualityIndex::Good => "good",
+                    AirqualityIndex::Moderate => "moderate",
+                    AirqualityIndex::Poor => "poor",
+                    AirqualityIndex::Unhealthy => "unhealthy",
+                }
+                .as_bytes(),
+            )?;
+        };
+
+        if let Some(SensorReading::Sht4x(rh, temp)) = sht4x_reading {
+            mqtt.publish(
+                "esp32_testing/humidity",
+                QoS::ExactlyOnce,
+                true,
+                rh.to_string().as_bytes(),
+            )?;
+            mqtt.publish(
+                "esp32_testing/temperature",
+                QoS::ExactlyOnce,
+                true,
+                temp.to_string().as_bytes(),
+            )?;
+        };
+
+        if let Some(SensorReading::Scd4x(co2, _, _)) = scd4x_reading {
+            mqtt.publish(
+                "esp32_testing/co2",
+                QoS::ExactlyOnce,
+                true,
+                co2.to_string().as_bytes(),
+            )?;
+        };
+
+        // if let Some(SensorReading::Pmsa003i(pm1, pm25, pm10)) = pmsa003i_reading {
+        //     mqtt.publish(
+        //         "esp32_testing/pm1",
+        //         QoS::ExactlyOnce,
+        //         true,
+        //         pm1.to_string().as_bytes(),
+        //     )?;
+        //     mqtt.publish(
+        //         "esp32_testing/pm2.5",
+        //         QoS::ExactlyOnce,
+        //         true,
+        //         pm25.to_string().as_bytes(),
+        //     )?;
+        //     mqtt.publish(
+        //         "esp32_testing/pm10",
+        //         QoS::ExactlyOnce,
+        //         true,
+        //         pm10.to_string().as_bytes(),
+        //     )?;
+        // };
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+
+    // connection_loop.await?;
+
+    // Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum SensorReading {
+    Sht4x(u16, f32),
+    Scd4x(u16, f32, f32),
+    Ens160(u16, u16, AirqualityIndex),
+    Pmsa003i(u16, u16, u16),
 }
 
 type Sht4xReading = (u16, f32);
 type Scd4xReading = (u16, f32, f32);
 type Ens160Reading = (u16, u16, AirqualityIndex);
+type Pmsa003iReading = (u16, u16, u16);
 
-async fn ens160_setup(
+async fn pmsa003i_setup(
+    sensor: &mut Pmsa003i<I2cProxy<'static, Mutex<I2cDriver<'_>>>>,
+) -> Result<()> {
+    info!(
+        "pmsa003i_sensor: setup: running task: {:?} on {:?}",
+        task::try_id().unwrap(),
+        core()
+    );
+    Ok(())
+}
+
+async fn pmsa003i_sensor(
     driver: I2cProxy<'static, Mutex<I2cDriver<'_>>>,
-) -> Result<Result<Ens160<I2cProxy<'static, Mutex<I2cDriver<'static>>>>, JoinError>, Elapsed> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        tokio::task::spawn_blocking(move || {
-            info!("sync ens160_sensor: setup: running on core: {:?}", core());
-            info!("sync ens160_sensor: setup...");
-            let mut sensor = Ens160::new(driver, 0x53);
+    tx: Sender<Pmsa003iReading>,
+) -> Result<()> {
+    let mut sensor = Pmsa003i::new(driver, esp32_env_sensor::pmsa003i::ADDRESS);
 
-            info!("sync ens160_sensor: reseting...");
-            sensor.reset().ok();
-            info!("sync ens160_sensor: device reset...");
-            // sleep(std::time::Duration::from_millis(250));
-            Handle::current().block_on(async {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            });
+    while let Err(err) = pmsa003i_setup(&mut sensor).await {
+        warn!("pmsa003i_sensor: error: {:?}", err);
+        tokio::time::sleep(std::time::Duration::from_millis(50000)).await;
+    }
 
-            info!("sync ens160_sensor: switch to operational mode...");
-            sensor.operational().ok();
-            // sleep(std::time::Duration::from_millis(50));
-            Handle::current().block_on(async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            });
+    loop {
+        info!("pmsa003i_sensor: reading measurements...");
+        match sensor.read() {
+            Ok(reading) => {
+                info!("pmsa003i_sensor: Broadcasting...");
+                tx.broadcast((reading.pm1(), reading.pm2_5(), reading.pm10()))
+                    .await?;
+            }
+            Err(e) => {
+                warn!("pmsa003i_sensor: error: {:?}", e);
+            }
+        };
+    }
+}
 
-            sensor
-        }),
-    )
-    .await
+async fn ens160_setup(sensor: &mut Ens160<I2cProxy<'static, Mutex<I2cDriver<'_>>>>) -> Result<()> {
+    info!(
+        "ens160_sensor: setup: running task: {:?} on {:?}",
+        task::try_id(),
+        core()
+    );
+    info!("ens160_sensor: reseting...");
+    sensor.reset()?;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    info!("sync ens160_sensor: switch to operational mode...");
+    sensor.operational()?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok(())
 }
 
 async fn ens160_sensor(
     tx: Sender<Ens160Reading>,
     mut rx: Receiver<Sht4xReading>,
     driver: I2cProxy<'static, Mutex<I2cDriver<'_>>>,
-    // mut sensor: Ens160<I2cProxy<'static, Mutex<I2cDriver<'_>>>>,
 ) -> Result<()> {
-    info!("ens160_sensor: running on core: {:?}", core());
-    let mut sensor = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || {
-            info!("ens160_sensor: setup: running on core: {:?}", core());
-            info!("ens160_sensor: setup...");
-            let mut sensor = Ens160::new(driver, 0x53);
+    let mut sensor = Ens160::new(driver, 0x53);
 
-            info!("ens160_sensor: reseting...");
-            sensor.reset().ok();
-            info!("ens160_sensor: device reset...");
-            // sleep(std::time::Duration::from_millis(250));
-            Handle::current().block_on(async {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            });
-
-            info!("ens160_sensor: switch to operational mode...");
-            sensor.operational().ok();
-            // sleep(std::time::Duration::from_millis(50));
-            Handle::current().block_on(async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            });
-
-            sensor
-        }),
-    )
-    .await??;
+    while let Err(err) = ens160_setup(&mut sensor).await {
+        warn!("ens160_sensor: error: {:?}", err);
+        tokio::time::sleep(std::time::Duration::from_millis(50000)).await;
+    }
 
     loop {
         info!("ens160_sensor: checking sensor status...");
@@ -225,7 +372,7 @@ async fn ens160_sensor(
             // Wait for data to be ready
             if status.data_is_ready() {
                 info!("ens160_sensor: check for correction values...");
-                if let core::result::Result::Ok((hum, temp)) = rx.try_recv() {
+                if let Ok((hum, temp)) = rx.try_recv() {
                     sensor.set_hum(hum)?;
                     sensor.set_temp((temp * 100_f32) as i16)?;
                 }
@@ -244,30 +391,50 @@ async fn ens160_sensor(
     }
 }
 
+async fn scd4x_setup(
+    sensor: &mut Scd4x<I2cProxy<'_, Mutex<I2cDriver<'_>>>, CustomDelay>,
+) -> Result<()> {
+    info!(
+        "scd41_sensor: setup: running task: {:?} on {:?}",
+        task::try_id(),
+        core()
+    );
+    info!("scd41_sensor: initializing...");
+    sensor.wake_up();
+    match sensor.stop_periodic_measurement() {
+        Ok(_) => {}
+        Err(e) => return Err(Error::msg(format!("{e:?}"))),
+    }; // TODO: uses custom error type not implementing Error trait
+    match sensor.reinit() {
+        Ok(_) => {}
+        Err(e) => return Err(Error::msg(format!("{e:?}"))),
+    };
+
+    let serial = match sensor.serial_number() {
+        Ok(x) => x,
+        Err(e) => return Err(Error::msg(format!("{e:?}"))),
+    };
+    info!("scd41_sensor: serial: {:#04x}", serial);
+
+    match sensor.start_periodic_measurement() {
+        Ok(_) => {}
+        Err(e) => return Err(Error::msg(format!("{e:?}"))),
+    };
+
+    Ok(())
+}
+
 async fn scd41_sensor(
     driver: I2cProxy<'static, Mutex<I2cDriver<'_>>>,
     tx: Sender<Scd4xReading>,
 ) -> Result<()> {
-    let mut sensor = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(|| {
-            info!("scd41_sensor: setup...");
-            let delay = CustomDelay {};
-            let mut sensor = Scd4x::new(driver, delay);
-            info!("scd41_sensor: initializing...");
-            sensor.wake_up();
-            sensor.stop_periodic_measurement().ok();
-            sensor.reinit().ok();
+    let delay = CustomDelay {};
+    let mut sensor = Scd4x::new(driver, delay);
 
-            let serial = sensor.serial_number().unwrap();
-            info!("scd41_sensor: serial: {:#04x}", serial);
-
-            sensor.start_periodic_measurement().unwrap();
-
-            sensor
-        }),
-    )
-    .await??;
+    while let Err(err) = scd4x_setup(&mut sensor).await {
+        warn!("scd41_sensor: error: {:?}", err);
+        tokio::time::sleep(std::time::Duration::from_millis(50000)).await;
+    }
 
     loop {
         info!("scd41_sensor: sleeping 5 secs...");
@@ -281,62 +448,58 @@ async fn scd41_sensor(
                 measurement.humidity,
                 measurement.temperature,
             ))
-            .await
-            .ok();
+            .await?;
         };
     }
 }
 
 async fn sht45_setup(
-    driver: I2cProxy<'static, Mutex<I2cDriver<'_>>>,
-) -> Result<
-    Result<Sht4x<I2cProxy<'static, Mutex<I2cDriver<'static>>>, CustomDelay>, JoinError>,
-    Elapsed,
-> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(|| {
-            info!("sht45_sensor: setup...");
-            let mut delay = CustomDelay {};
-            let mut sensor = Sht4x::new(driver);
-            info!("sht45_sensor: verifying connection...");
-            sensor.serial_number(&mut delay).ok();
-            sensor
-        }),
-    )
-    .await
+    sensor: &mut Sht4x<I2cProxy<'static, Mutex<I2cDriver<'static>>>, CustomDelay>,
+) -> Result<()> {
+    info!(
+        "sht45_sensor: setup: running task: {:?} on {:?}",
+        task::try_id(),
+        core()
+    );
+    info!("sht45_sensor: verifying connection...");
+    let mut delay = CustomDelay {};
+    match sensor.serial_number(&mut delay) {
+        Ok(serial) => info!("sht45_sensor: serial: {:#04x}", serial),
+        Err(e) => return Err(Error::msg(format!("{e:?}"))),
+    };
+    Ok(())
 }
 
 async fn sht45_sensor(
     tx: Sender<Sht4xReading>,
-    driver: I2cProxy<'static, std::sync::Mutex<I2cDriver<'_>>>,
+    driver: I2cProxy<'static, Mutex<I2cDriver<'_>>>,
 ) -> Result<()> {
     let mut delay = CustomDelay {};
-    let (mut sensor, mut delay) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(|| {
-            info!("sht45_sensor: setup...");
-            let mut sensor = Sht4x::new(driver);
-            info!("sht45_sensor: verifying connection...");
-            sensor.serial_number(&mut delay).ok();
-            (sensor, delay)
-        }),
-    )
-    .await??;
+    let mut sensor = Sht4x::new(driver);
+
+    while let Err(err) = sht45_setup(&mut sensor).await {
+        warn!("sht45_sensor: error: {:?}", err);
+        tokio::time::sleep(std::time::Duration::from_millis(50000)).await;
+    }
 
     loop {
         info!("sht45_sensor: taking measurement...");
-        let measurement = sensor.measure(sht4x::Precision::Low, &mut delay);
+        let result = sensor.measure(sht4x::Precision::High, &mut delay);
 
         info!("sht45_sensor: evaluating measurands...");
-        if let core::result::Result::Ok(val) = measurement {
-            info!("sht45_sensor: Broadcasting measurements...");
-            tx.broadcast((
-                val.humidity_percent().to_num(),
-                val.temperature_celsius().to_num(),
-            ))
-            .await
-            .ok();
+        match result {
+            Ok(val) => {
+                info!("sht45_sensor: Broadcasting measurements...");
+                tx.broadcast((
+                    val.humidity_percent().to_num(),
+                    val.temperature_celsius().to_num(),
+                ))
+                .await
+                .ok();
+            }
+            Err(e) => {
+                warn!("sht45_sensor: error: {:?}", e);
+            }
         }
 
         info!("sht45_sensor: sleeping...");
@@ -363,12 +526,12 @@ pub struct WifiLoop<'a> {
 }
 
 impl<'a> WifiLoop<'a> {
-    pub async fn configure(&mut self) -> Result<(), EspError> {
+    pub async fn configure(&mut self, ssid: &str, psswd: &str) -> Result<(), EspError> {
         info!("Setting Wi-Fi credentials...");
         self.wifi
             .set_configuration(&Configuration::Client(ClientConfiguration {
-                ssid: WIFI_SSID.into(),
-                password: WIFI_PASS.into(),
+                ssid: ssid.into(),
+                password: psswd.into(),
                 auth_method: AuthMethod::WPA2WPA3Personal,
                 ..Default::default()
             }))?;
@@ -445,37 +608,6 @@ async fn serve_client(mut stream: TcpStream) -> anyhow::Result<()> {
 
         stream.write_all(&buf[0..n]).await?;
         info!("Wrote {n} bytes back...");
-    }
-
-    Ok(())
-}
-
-async fn sensor(tx: Sender<String>) -> Result<()> {
-    for i in 0..100 {
-        info!("Broadcasting from {:?}: {}", core(), i);
-        tx.broadcast(format!("{i}")).await?;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    Ok(())
-}
-
-async fn sensor2(mut rx: Receiver<String>) -> Result<()> {
-    loop {
-        let data = match rx.recv().await {
-            core::result::Result::Ok(x) => x,
-            core::result::Result::Err(e) => match e {
-                async_broadcast::RecvError::Closed => {
-                    warn!("Channel closed");
-                    break;
-                }
-                async_broadcast::RecvError::Overflowed(num) => {
-                    warn!("Channel overflow, missed {num} message(s)");
-                    continue;
-                }
-            },
-        };
-        info!("Received in {:?}: {}", core(), data);
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 
     Ok(())

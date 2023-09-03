@@ -1,0 +1,6 @@
+[esp32-env-sensor]
+mqtt_user = ""
+mqtt_pass = ""
+mqtt_host = "test.mosquitto.org:1883"
+wifi_ssid = "your ssid"
+wifi_psk = "your password"
