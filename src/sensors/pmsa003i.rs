@@ -1,8 +1,12 @@
-#![allow(dead_code)]
-
 use embedded_hal::blocking::i2c::*;
 
+use super::i2c_sensor::I2CSensor;
+
 pub const ADDRESS: u8 = 0x12;
+
+const MAGIC_BYTE_0: u8 = 0x42;
+const MAGIC_BYTE_1: u8 = 0x4d;
+const PAYLOAD_LEN: usize = 32;
 
 pub struct Pmsa003i<T>
 where
@@ -12,17 +16,18 @@ where
     address: u8,
 }
 
-impl<T> Pmsa003i<T>
+impl<T, E> I2CSensor<T, E> for Pmsa003i<T>
 where
-    T: WriteRead + Read + Write,
+    T: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
+    E: std::fmt::Debug,
 {
     /// Creates a new sensor driver.
-    pub fn new(i2c: T, address: u8) -> Self {
+    fn new(i2c: T, address: u8) -> Self {
         Self { i2c, address }
     }
 
     /// Releases the underlying I2C bus and destroys the driver.
-    pub fn release(self) -> T {
+    fn release(self) -> T {
         self.i2c
     }
 }
@@ -40,6 +45,14 @@ where
         } else {
             parse_data(&buf)
         }
+    }
+
+    pub fn version(&mut self) -> Result<u16, SensorError<E>> {
+        let mut buf: [u8; 2] = [0; 2];
+        self.i2c
+            .write_read(self.address, &[0x00], &mut buf)
+            .map_err(SensorError::ReadError)?;
+        Ok(as_u16(buf[0], buf[1]))
     }
 }
 
@@ -131,15 +144,13 @@ impl Reading {
     }
 }
 
-const MAGIC_BYTE_0: u8 = 0x42;
-const MAGIC_BYTE_1: u8 = 0x4d;
-const PAYLOAD_LEN: usize = 32;
-
 fn parse_data<E: std::fmt::Debug>(buf: &[u8; PAYLOAD_LEN]) -> Result<Reading, SensorError<E>> {
     let sum = buf[0..PAYLOAD_LEN - 2]
         .iter()
         .fold(0u16, |accum, next| accum + *next as u16);
+
     let expected_sum: u16 = ((buf[PAYLOAD_LEN - 2] as u16) << 8) | (buf[PAYLOAD_LEN - 1] as u16);
+
     if expected_sum == sum {
         Ok(Reading {
             pm1: as_u16(buf[4], buf[5]),
@@ -160,6 +171,7 @@ fn parse_data<E: std::fmt::Debug>(buf: &[u8; PAYLOAD_LEN]) -> Result<Reading, Se
     }
 }
 
+/// Converts two bytes into a u16
 fn as_u16(hi: u8, lo: u8) -> u16 {
     ((hi as u16) << 8) | (lo as u16)
 }

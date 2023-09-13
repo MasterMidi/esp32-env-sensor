@@ -5,6 +5,8 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
+use serde::Serialize;
+
 use embedded_hal::blocking::i2c::*;
 
 use bitfield::bitfield;
@@ -198,7 +200,7 @@ impl From<u8> for Validity {
     }
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[repr(u8)]
 pub enum AirqualityIndex {
     Excellent = 1,
