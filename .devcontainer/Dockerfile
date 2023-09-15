@@ -13,7 +13,7 @@ ARG GITHUB_TOKEN
 
 # update system
 RUN apt-get update && \
-    apt-get install -y nano git curl lldb clang ninja-build libudev-dev unzip xz-utils \
+    apt-get install -y nano git curl lldb clang cmake ninja-build libudev-dev unzip xz-utils \
     python3 python3-pip python3-venv libusb-1.0-0 libssl-dev pkg-config
 
 # cleanup

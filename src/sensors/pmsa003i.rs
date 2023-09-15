@@ -1,3 +1,8 @@
+use std::{
+    error::Error,
+    fmt::{Debug, Display, Formatter},
+};
+
 use embedded_hal::blocking::i2c::*;
 
 use super::i2c_sensor::I2CSensor;
@@ -35,11 +40,10 @@ where
 impl<I2C, E> Pmsa003i<I2C>
 where
     I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
-    E: std::fmt::Debug,
+    E: Debug,
 {
     pub fn read(&mut self) -> Result<Reading, SensorError<E>> {
-        let mut buf: [u8; PAYLOAD_LEN] = [0; PAYLOAD_LEN];
-        self.i2c.read(self.address, &mut buf)?;
+        let buf = self.read_device()?;
         if buf[0] != MAGIC_BYTE_0 || buf[1] != MAGIC_BYTE_1 {
             Err(SensorError::BadMagic)
         } else {
@@ -48,11 +52,16 @@ where
     }
 
     pub fn version(&mut self) -> Result<u16, SensorError<E>> {
-        let mut buf: [u8; 2] = [0; 2];
-        self.i2c
-            .write_read(self.address, &[0x00], &mut buf)
+        let buf = self
+            .read_device::<PAYLOAD_LEN>()
             .map_err(SensorError::ReadError)?;
         Ok(as_u16(buf[0], buf[1]))
+    }
+
+    fn read_device<const N: usize>(&mut self) -> Result<[u8; N], E> {
+        let mut buf = [0u8; N];
+        self.i2c.read(self.address, &mut buf).ok();
+        Ok(buf)
     }
 }
 
@@ -144,31 +153,51 @@ impl Reading {
     }
 }
 
-fn parse_data<E: std::fmt::Debug>(buf: &[u8; PAYLOAD_LEN]) -> Result<Reading, SensorError<E>> {
-    let sum = buf[0..PAYLOAD_LEN - 2]
-        .iter()
-        .fold(0u16, |accum, next| accum + *next as u16);
+/// Combine buffer into type T using bit-shifting
+macro_rules! combine {
+    ($buf:expr, $T:ty, $endianness:ident) => {{
+        let mut result: $T = 0;
+        let size = std::mem::size_of::<$T>();
 
-    let expected_sum: u16 = ((buf[PAYLOAD_LEN - 2] as u16) << 8) | (buf[PAYLOAD_LEN - 1] as u16);
+        for i in 0..size {
+            let shift = match $endianness {
+                LittleEndian => i * 8,
+                BigEndian => (size - 1 - i) * 8,
+            };
+            result |= ($buf[i] as $T) << shift;
+        }
 
-    if expected_sum == sum {
-        Ok(Reading {
-            pm1: as_u16(buf[4], buf[5]),
-            pm2_5: as_u16(buf[6], buf[7]),
-            pm10: as_u16(buf[8], buf[9]),
-            env_pm1: as_u16(buf[10], buf[11]),
-            env_pm2_5: as_u16(buf[12], buf[13]),
-            env_pm10: as_u16(buf[14], buf[15]),
-            particles_0_3: as_u16(buf[16], buf[17]),
-            particles_0_5: as_u16(buf[18], buf[19]),
-            particles_1: as_u16(buf[20], buf[21]),
-            particles_2_5: as_u16(buf[22], buf[23]),
-            particles_5: as_u16(buf[24], buf[25]),
-            particles_10: as_u16(buf[26], buf[27]),
-        })
-    } else {
-        Err(SensorError::ChecksumMismatch)
+        result
+    }};
+}
+
+#[derive(Debug)]
+enum Endianness {
+    LittleEndian,
+    BigEndian,
+}
+
+fn parse_data<E: Debug>(buf: &[u8; PAYLOAD_LEN]) -> Result<Reading, SensorError<E>> {
+    use Endianness::*;
+
+    if !is_valid(buf) {
+        return Err(SensorError::ChecksumMismatch);
     }
+
+    Ok(Reading {
+        pm1: combine!(&buf[4..=5], u16, LittleEndian),
+        pm2_5: as_u16(buf[6], buf[7]),
+        pm10: as_u16(buf[8], buf[9]),
+        env_pm1: as_u16(buf[10], buf[11]),
+        env_pm2_5: as_u16(buf[12], buf[13]),
+        env_pm10: as_u16(buf[14], buf[15]),
+        particles_0_3: as_u16(buf[16], buf[17]),
+        particles_0_5: as_u16(buf[18], buf[19]),
+        particles_1: as_u16(buf[20], buf[21]),
+        particles_2_5: as_u16(buf[22], buf[23]),
+        particles_5: as_u16(buf[24], buf[25]),
+        particles_10: as_u16(buf[26], buf[27]),
+    })
 }
 
 /// Converts two bytes into a u16
@@ -176,9 +205,20 @@ fn as_u16(hi: u8, lo: u8) -> u16 {
     ((hi as u16) << 8) | (lo as u16)
 }
 
+/// Validates the checksum of the data package
+fn is_valid(buf: &[u8; PAYLOAD_LEN]) -> bool {
+    let sum = buf[0..PAYLOAD_LEN - 2]
+        .iter()
+        .fold(0u16, |accum, next| accum + *next as u16);
+
+    let expected_sum = as_u16(buf[PAYLOAD_LEN - 2], buf[PAYLOAD_LEN - 1]);
+
+    expected_sum == sum
+}
+
 /// Describes errors returned by the air quality sensor
 #[derive(Debug)]
-pub enum SensorError<E: std::fmt::Debug> {
+pub enum SensorError<E: Debug> {
     /// Couldn't find the "magic" bytes that indicate the start of a data frame
     ///
     /// This likely means that you've set an incorrect baud rate, or there is something
@@ -192,8 +232,8 @@ pub enum SensorError<E: std::fmt::Debug> {
     ReadError(E),
 }
 
-impl<E: std::fmt::Debug> std::fmt::Display for SensorError<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<E: Debug> Display for SensorError<E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use SensorError::*;
         match self {
             BadMagic => f.write_str("Unable to find magic bytes at start of payload"),
@@ -203,10 +243,9 @@ impl<E: std::fmt::Debug> std::fmt::Display for SensorError<E> {
     }
 }
 
-#[cfg(feature = "std")]
-impl<E: std::fmt::Debug> std::error::Error for SensorError<E> {}
+impl<E: Debug> Error for SensorError<E> {}
 
-impl<E: std::fmt::Debug> From<E> for SensorError<E> {
+impl<E: Debug> From<E> for SensorError<E> {
     fn from(error: E) -> Self {
         SensorError::ReadError(error)
     }

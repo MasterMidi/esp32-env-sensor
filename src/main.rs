@@ -218,33 +218,34 @@ async fn publish_loop(
 
 #[derive(Debug, Clone, Serialize)]
 struct Ens160Reading {
-    tvoc: u16,
-    eco2: u16,
+    tvoc: Reading<u16>,
+    eco2: Reading<u16>,
     aqi: AirqualityIndex,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Sht4xReading {
-    humidity: u16,
-    temperature: f32,
+    humidity: Reading<u16>,
+    temperature: Reading<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Scd4xReading {
-    co2: u16,
-    humidity: f32,
-    temperature: f32,
+    co2: Reading<u16>,
+    humidity: Reading<f32>,
+    temperature: Reading<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Pmsa003iReading {
-    pm1: u16,
-    pm2_5: u16,
-    pm10: u16,
+    pm1: Reading<u16>,
+    pm2_5: Reading<u16>,
+    pm10: Reading<u16>,
 }
 
-struct Co2 {
-    value: u16,
+#[derive(Debug, Clone, Serialize)]
+struct Reading<T> {
+    value: T,
     unit: &'static str,
 }
 
@@ -279,9 +280,18 @@ async fn pmsa003i_sensor(
             Ok(reading) => {
                 info!("pmsa003i_sensor: Broadcasting...");
                 tx.broadcast(Pmsa003iReading {
-                    pm1: reading.pm1(),
-                    pm2_5: reading.pm2_5(),
-                    pm10: reading.pm10(),
+                    pm1: Reading {
+                        value: reading.pm1(),
+                        unit: "µg/m³",
+                    },
+                    pm2_5: Reading {
+                        value: reading.pm2_5(),
+                        unit: "µg/m³",
+                    },
+                    pm10: Reading {
+                        value: reading.pm10(),
+                        unit: "µg/m³",
+                    },
                 })
                 .await?;
             }
@@ -329,8 +339,8 @@ async fn ens160_sensor(
             if status.data_is_ready() {
                 if let Ok(reading) = next_message(&mut rx) {
                     info!("ens160_sensor: check for correction values...");
-                    sensor.set_hum(reading.humidity * 100)?;
-                    sensor.set_temp((reading.temperature * 100_f32) as i16)?;
+                    sensor.set_hum(reading.humidity.value * 100)?;
+                    sensor.set_temp((reading.temperature.value * 100_f32) as i16)?;
                 }
 
                 info!("ens160_sensor: reading measurements...");
@@ -339,8 +349,14 @@ async fn ens160_sensor(
                 let aqi = sensor.airquality_index()?;
                 info!("ens160_sensor: Broadcasting...");
                 tx.broadcast(Ens160Reading {
-                    tvoc,
-                    eco2: *eco2,
+                    tvoc: Reading {
+                        value: tvoc,
+                        unit: "ppb",
+                    },
+                    eco2: Reading {
+                        value: *eco2,
+                        unit: "ppm",
+                    },
                     aqi,
                 })
                 .await?;
@@ -405,9 +421,18 @@ async fn scd41_sensor(
         if let Ok(measurement) = sensor.measurement() {
             info!("sht45_sensor: Broadcasting measurements...");
             tx.broadcast(Scd4xReading {
-                co2: measurement.co2,
-                humidity: measurement.humidity,
-                temperature: measurement.temperature,
+                co2: Reading {
+                    value: measurement.co2,
+                    unit: "ppm",
+                },
+                humidity: Reading {
+                    value: measurement.humidity,
+                    unit: "%",
+                },
+                temperature: Reading {
+                    value: measurement.temperature,
+                    unit: "°C",
+                },
             })
             .await?;
         };
@@ -452,8 +477,14 @@ async fn sht45_sensor(
             Ok(val) => {
                 info!("sht45_sensor: Broadcasting measurements...");
                 tx.broadcast(Sht4xReading {
-                    humidity: val.humidity_percent().to_num(),
-                    temperature: val.temperature_celsius().to_num(),
+                    humidity: Reading {
+                        value: val.humidity_percent().to_num(),
+                        unit: "%",
+                    },
+                    temperature: Reading {
+                        value: val.temperature_celsius().to_num(),
+                        unit: "°C",
+                    },
                 })
                 .await
                 .ok();
